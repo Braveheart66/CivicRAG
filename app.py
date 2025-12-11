@@ -561,7 +561,37 @@ def synthesize(body: SynthesizeIn):
         payload_text = "\n".join(lines) + "\n\n" + next_steps
         return {"text": payload_text}
 
-# --------- Run server ---------
+# -------------- SAFE STARTUP PATCH (WORKS ON RESTRICTED HOSTS) --------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=True)
+    import os
+    import logging
+
+    PORT = int(os.environ.get("PORT", "8000"))
+
+    # Enable reload ONLY in local development by setting:
+    #    ENABLE_UVICORN_RELOAD=true
+    enable_reload = os.environ.get("ENABLE_UVICORN_RELOAD", "false").lower() in (
+        "1", "true", "yes"
+    )
+
+    try:
+        uvicorn.run(
+            "app:app",
+            host="0.0.0.0",
+            port=PORT,
+            reload=enable_reload
+        )
+    except ValueError as e:
+        # Happens on Streamlit Cloud / restricted environments
+        logging.warning(
+            "Uvicorn reload mode failed due to environment restrictions. "
+            "Retrying with reload=False. Error: %s",
+            str(e)
+        )
+        uvicorn.run(
+            "app:app",
+            host="0.0.0.0",
+            port=PORT,
+            reload=False
+        )
