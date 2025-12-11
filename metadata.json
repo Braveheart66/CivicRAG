@@ -1,0 +1,5 @@
+{
+  "name": "CivicRAG - Scheme Recommender",
+  "description": "A RAG-based Government Scheme Recommendation prototype demonstrating the Free-Stack architecture. It simulates the retrieval pipeline and uses Gemini for the generation layer.",
+  "requestFramePermissions": []
+}
