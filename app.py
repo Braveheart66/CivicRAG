@@ -1,349 +1,567 @@
+# app.py
 """
-app.py
+Backend for CivicRAG React frontend.
 
-FastAPI backend for CivicRAG-like RAG demo:
-- Uses sentence-transformers for query embeddings
-- Uses chromadb (local) for vector retrieval
-- Sends a synthesis prompt to an LLM (OpenAI or Google Gemini) or uses local fallback
+Endpoints:
+- POST /retrieve   -> { profile } -> returns list of matched schemes
+- POST /synthesize -> { profile, schemes, language } -> returns synthesized text (Gemini)
 """
 
 import os
 import json
 import logging
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
-
-# Embeddings + Vector DB
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
-
-# HTTP for calling LLM endpoints
+from dotenv import load_dotenv
 import requests
 
-# Load environment
-from dotenv import load_dotenv
 load_dotenv()
 
-# Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("civicrag")
+logger = logging.getLogger("civicrag_server")
 
-# Configuration: choose LLM provider via env
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").lower()  # options: openai | gemini | local
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Basic service config
-CHROMA_PERSIST_DIR = os.environ.get("CHROMA_PERSIST_DIR", "./chroma_db")
-EMBED_MODEL_NAME = os.environ.get("EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
-TOP_K = int(os.environ.get("TOP_K", "6"))
-MAX_SNIPPET_CHARS = int(os.environ.get("MAX_SNIPPET_CHARS", "320"))
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_BASE_URL = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")
+PORT = int(os.environ.get("PORT", "8000"))
 
-# Initialize FastAPI
-app = FastAPI(title="CivicRAG Backend")
-
+app = FastAPI(title="CivicRAG Backend (Retrieve + Synthesize)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],  # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models
-class Profile(BaseModel):
+# --------- Data models ---------
+class ProfileIn(BaseModel):
     name: Optional[str] = None
     age: Optional[int] = None
     gender: Optional[str] = None
     state: Optional[str] = None
-    annual_income: Optional[float] = None
+    income: Optional[float] = None
     occupation: Optional[str] = None
-    text: Optional[str] = None  # free-form description (english/hindi)
+    text: Optional[str] = None
 
-class RecommendationSnippet(BaseModel):
-    text: str
-    scheme_id: Optional[str] = None
-    url: Optional[str] = None
-    page_no: Optional[int] = None
-    score: Optional[float] = None
+class SchemeOut(BaseModel):
+    id: str
+    name: str
+    name_hi: Optional[str] = None
+    description: Optional[str] = None
+    description_hi: Optional[str] = None
+    eligibilityCriteria: Optional[List[str]] = []
+    eligibilityCriteria_hi: Optional[List[str]] = []
+    benefits: Optional[str] = None
+    benefits_hi: Optional[str] = None
+    category: Optional[str] = None
+    category_hi: Optional[str] = None
+    sourceUrl: Optional[str] = None
+    state: Optional[str] = None
+    matchScore: Optional[float] = 0.0
 
-class Recommendation(BaseModel):
-    scheme_id: str
-    title: str
-    eligibility_label: str
-    confidence: float
-    required_documents: Optional[List[str]] = []
-    apply_link: Optional[str] = None
-    supporting_snippets: List[RecommendationSnippet]
+class RetrieveIn(BaseModel):
+    profile: ProfileIn
 
-class RecommendResponse(BaseModel):
-    profile: Profile
-    recommendations: List[Recommendation]
+class SynthesizeIn(BaseModel):
+    profile: ProfileIn
+    schemes: List[SchemeOut]
+    language: Optional[str] = "en"
 
-# Initialize embeddings model
-logger.info("Loading embedding model: %s", EMBED_MODEL_NAME)
-embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+# --------- Mock schemes (copied from your frontend) ---------
+SCHEMES: List[Dict[str, Any]] = [
+  {
+    "id": "pm-kisan",
+    "name": "PM Kisan Samman Nidhi",
+    "name_hi": "प्रधानमंत्री किसान सम्मान निधि",
+    "description": "Income support of Rs 6000 per year for all land holding farmer families.",
+    "description_hi": "सभी भूमिधारक किसान परिवारों के लिए प्रति वर्ष 6000 रुपये की आय सहायता।",
+    "eligibilityCriteria": [
+      "Landholding farmer families",
+      "Excludes institutional landholders",
+      "Excludes income tax payers"
+    ],
+    "eligibilityCriteria_hi": [
+        "भूमिधारक किसान परिवार",
+        "संस्थागत भूमिधारकों को छोड़कर",
+        "आयकर दाताओं को छोड़कर"
+    ],
+    "benefits": "INR 6000 per year in 3 installments.",
+    "benefits_hi": "3 किस्तों में प्रति वर्ष 6000 रुपये।",
+    "category": "Agriculture",
+    "category_hi": "कृषि",
+    "sourceUrl": "https://pmkisan.gov.in",
+    "state": "Central"
+  },
+  {
+    "id": "ayushman-bharat",
+    "name": "Ayushman Bharat (PM-JAY)",
+    "name_hi": "आयुष्मान भारत (PM-JAY)",
+    "description": "Health assurance scheme providing cover of Rs. 5 lakhs per family per year for secondary and tertiary care hospitalization.",
+    "description_hi": "माध्यमिक और तृतीयक देखभाल अस्पताल में भर्ती के लिए प्रति परिवार प्रति वर्ष 5 लाख रुपये का स्वास्थ्य कवर।",
+    "eligibilityCriteria": [
+      "Identified families based on SECC 2011 data",
+      "Households with no adult member between 16-59",
+      "Households with no able-bodied adult member"
+    ],
+    "eligibilityCriteria_hi": [
+        "एसईसीसी 2011 डेटा के आधार पर पहचाने गए परिवार",
+        "ऐसे परिवार जिनमें 16-59 वर्ष के बीच कोई वयस्क सदस्य नहीं है",
+        "ऐसे परिवार जिनमें कोई सक्षम वयस्क सदस्य नहीं है"
+    ],
+    "benefits": "Cashless access to health care services up to INR 5 Lakhs.",
+    "benefits_hi": "5 लाख रुपये तक की कैशलेस स्वास्थ्य सेवाएँ।",
+    "category": "Health",
+    "category_hi": "स्वास्थ्य",
+    "sourceUrl": "https://pmjay.gov.in",
+    "state": "Central"
+  },
+  {
+    "id": "pm-svanidhi",
+    "name": "PM SVANidhi",
+    "name_hi": "पीएम स्वनिधि",
+    "description": "Special Micro-Credit Facility for Street Vendors.",
+    "description_hi": "सड़क विक्रेताओं के लिए विशेष माइक्रो-क्रेडिट सुविधा।",
+    "eligibilityCriteria": [
+      "Street vendors in urban areas",
+      "Vending on or before 24 March 2020"
+    ],
+    "eligibilityCriteria_hi": [
+        "शहरी क्षेत्रों में सड़क विक्रेता",
+        "24 मार्च 2020 को या उससे पहले वेंडिंग"
+    ],
+    "benefits": "Working capital loan up to Rs. 10,000.",
+    "benefits_hi": "10,000 रुपये तक का कार्यशील पूंजी ऋण।",
+    "category": "Business/Loan",
+    "category_hi": "व्यापार/ऋण",
+    "sourceUrl": "https://pmsvanidhi.mohua.gov.in",
+    "state": "Central"
+  },
+  {
+    "id": "sukanya-samriddhi",
+    "name": "Sukanya Samriddhi Yojana",
+    "name_hi": "सुकन्या समृद्धि योजना",
+    "description": "A small deposit scheme for the girl child.",
+    "description_hi": "बालिकाओं के लिए एक छोटी जमा योजना।",
+    "eligibilityCriteria": [
+      "Girl child below 10 years of age",
+      "Account can be opened by parent/guardian"
+    ],
+    "eligibilityCriteria_hi": [
+        "10 वर्ष से कम उम्र की बालिका",
+        "खाता माता-पिता/अभिभावक द्वारा खोला जा सकता है"
+    ],
+    "benefits": "High interest rate, tax benefits under 80C.",
+    "benefits_hi": "उच्च ब्याज दर, 80सी के तहत कर लाभ।",
+    "category": "Child Welfare",
+    "category_hi": "बाल कल्याण",
+    "sourceUrl": "https://www.nsiindia.gov.in",
+    "state": "Central"
+  },
+  {
+    "id": "atal-pension",
+    "name": "Atal Pension Yojana",
+    "name_hi": "अटल पेंशन योजना",
+    "description": "Pension scheme for unorganized sector workers.",
+    "description_hi": "असंगठित क्षेत्र के श्रमिकों के लिए पेंशन योजना।",
+    "eligibilityCriteria": [
+      "Age between 18-40 years",
+      "Have a savings bank account"
+    ],
+    "eligibilityCriteria_hi": [
+        "उम्र 18-40 वर्ष के बीच",
+        "बचत बैंक खाता होना चाहिए"
+    ],
+    "benefits": "Guaranteed pension of Rs 1000-5000 per month after 60 years.",
+    "benefits_hi": "60 वर्ष के बाद 1000-5000 रुपये प्रति माह की गारंटीड पेंशन।",
+    "category": "Pension",
+    "category_hi": "पेंशन",
+    "sourceUrl": "https://www.npscra.nsdl.co.in",
+    "state": "Central"
+  },
+  {
+    "id": "ladli-behna",
+    "name": "Mukhyamantri Ladli Behna Yojana (MP)",
+    "name_hi": "मुख्यमंत्री लाड़ली बहना योजना (मध्य प्रदेश)",
+    "description": "Financial assistance scheme for women in Madhya Pradesh.",
+    "description_hi": "मध्य प्रदेश में महिलाओं के लिए वित्तीय सहायता योजना।",
+    "eligibilityCriteria": [
+      "Resident of Madhya Pradesh",
+      "Married women aged 21-60 years",
+      "Family income less than 2.5 Lakhs"
+    ],
+    "eligibilityCriteria_hi": [
+        "मध्य प्रदेश की निवासी",
+        "21-60 वर्ष की विवाहित महिलाएं",
+        "पारिवारिक आय 2.5 लाख से कम"
+    ],
+    "benefits": "INR 1250 per month directly to bank account.",
+    "benefits_hi": "1250 रुपये प्रति माह सीधे बैंक खाते में।",
+    "category": "Women Welfare",
+    "category_hi": "महिला कल्याण",
+    "sourceUrl": "https://cmladlibehna.mp.gov.in/",
+    "state": "Madhya Pradesh"
+  },
+  {
+    "id": "rythu-bandhu",
+    "name": "Rythu Bandhu (Telangana)",
+    "name_hi": "रायथु बंधु (तेलंगाना)",
+    "description": "Investment Support Scheme for landholding farmers.",
+    "description_hi": "भूमिधारक किसानों के लिए निवेश सहायता योजना।",
+    "eligibilityCriteria": [
+      "Resident of Telangana",
+      "Must own farm land",
+      "Commercial farmers excluded"
+    ],
+    "eligibilityCriteria_hi": [
+        "तेलंगाना के निवासी",
+        "कृषि भूमि का स्वामी होना चाहिए",
+        "वाणिज्यिक किसान शामिल नहीं"
+    ],
+    "benefits": "INR 5000 per acre per season.",
+    "benefits_hi": "5000 रुपये प्रति एकड़ प्रति सीजन।",
+    "category": "Agriculture",
+    "category_hi": "कृषि",
+    "sourceUrl": "http://rythubandhu.telangana.gov.in/",
+    "state": "Telangana"
+  },
+  {
+    "id": "kanyashree",
+    "name": "Kanyashree Prakalpa (West Bengal)",
+    "name_hi": "कन्याश्री प्रकल्प (पश्चिम बंगाल)",
+    "description": "Conditional Cash Transfer Scheme for improving the status and well being of the girl child.",
+    "description_hi": "बालिकाओं की स्थिति और कल्याण में सुधार के लिए सशर्त नकद हस्तांतरण योजना।",
+    "eligibilityCriteria": [
+      "Resident of West Bengal",
+      "Girl student aged 13-18 years",
+      "Unmarried"
+    ],
+    "eligibilityCriteria_hi": [
+        "पश्चिम बंगाल की निवासी",
+        "13-18 वर्ष की छात्रा",
+        "अविवाहित"
+    ],
+    "benefits": "Annual scholarship of INR 1000 and one-time grant of INR 25,000.",
+    "benefits_hi": "1000 रुपये की वार्षिक छात्रवृत्ति और 25,000 रुपये का एकमुश्त अनुदान।",
+    "category": "Education/Women",
+    "category_hi": "शिक्षा/महिला",
+    "sourceUrl": "https://www.wbkanyashree.gov.in/",
+    "state": "West Bengal"
+  },
+  {
+    "id": "delhi-electricity",
+    "name": "Delhi Free Electricity Scheme",
+    "name_hi": "दिल्ली मुफ्त बिजली योजना",
+    "description": "Subsidy on electricity bills for domestic consumers in Delhi.",
+    "description_hi": "दिल्ली में घरेलू उपभोक्ताओं के लिए बिजली बिल पर सब्सिडी।",
+    "eligibilityCriteria": [
+      "Resident of Delhi",
+      "Domestic electricity connection",
+      "Consumption up to 200 units (Free)"
+    ],
+    "eligibilityCriteria_hi": [
+        "दिल्ली के निवासी",
+        "घरेलू बिजली कनेक्शन",
+        "200 यूनिट तक खपत (मुफ्त)"
+    ],
+    "benefits": "Zero bill for consumption up to 200 units.",
+    "benefits_hi": "200 यूनिट तक की खपत के लिए शून्य बिल।",
+    "category": "Utility",
+    "category_hi": "उपयोगिता",
+    "sourceUrl": "https://delhi.gov.in",
+    "state": "Delhi"
+  }
+]
 
-# Initialize Chroma client (local persistent)
-logger.info("Initializing Chroma client (persist dir: %s)", CHROMA_PERSIST_DIR)
-chroma_client = chromadb.Client(
-    Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory=CHROMA_PERSIST_DIR,
-    )
-)
+# --------- Retrieval logic (mirrors the TS prototype) ---------
+def strict_retrieve(profile: ProfileIn) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
 
-# Expect a collection named "schemes" to already exist (ingestion step populates it)
-COLLECTION_NAME = "schemes"
-try:
-    collection = chroma_client.get_collection(name=COLLECTION_NAME)
-    logger.info("Loaded existing Chroma collection: %s", COLLECTION_NAME)
-except Exception:
-    logger.info("Collection '%s' not found. Creating an empty collection.", COLLECTION_NAME)
-    collection = chroma_client.create_collection(name=COLLECTION_NAME)
-
-# Utility: retrieve top-k chunks from Chroma
-def retrieve_chunks(query: str, k: int = TOP_K, metadata_filter: Optional[Dict[str, Any]] = None):
-    if not query:
-        return []
-    q_emb = embed_model.encode([query])[0].tolist()
-    # chroma's query API
+    age = None
+    income = None
     try:
-        # filter may be None or dict
-        results = collection.query(
-            query_embeddings=[q_emb],
-            n_results=k,
-            where=metadata_filter or {},
-            include=["metadatas", "distances", "documents", "ids"]
-        )
-    except Exception as e:
-        logger.exception("Chroma query failed: %s", e)
-        return []
+        age = int(profile.age) if profile.age is not None else None
+    except Exception:
+        age = None
+    try:
+        income = float(profile.income) if profile.income is not None else None
+    except Exception:
+        income = None
 
-    # results: dict with lists under keys
-    out = []
-    if results and "documents" in results and len(results["documents"]) > 0:
-        docs = results["documents"][0]
-        metas = results.get("metadatas", [{}])[0]
-        dists = results.get("distances", [[]])[0]
-        ids = results.get("ids", [[]])[0]
-        for i, doc in enumerate(docs):
-            meta = metas[i] if i < len(metas) else {}
-            dist = dists[i] if i < len(dists) else None
-            doc_text = doc if isinstance(doc, str) else str(doc)
-            snippet_text = doc_text[:MAX_SNIPPET_CHARS]
-            out.append({
-                "text": snippet_text,
-                "full_text": doc_text,
-                "scheme_id": meta.get("scheme_id"),
-                "title": meta.get("title"),
-                "url": meta.get("source_url"),
-                "page_no": meta.get("page_no"),
-                "score": float(dist) if dist is not None else None,
-                "id": ids[i] if i < len(ids) else None
-            })
-    return out
+    occupation = profile.occupation.lower() if profile.occupation else ""
 
-# Utility: call LLM to synthesize answer given profile and snippets
-def synthesize_answer(profile: Profile, snippets: List[Dict[str, Any]]):
-    # Build a controlled prompt for the LLM
-    user_profile_text = json.dumps(profile.dict(), ensure_ascii=False)
-    snippet_texts = []
-    for s in snippets:
-        t = s.get("full_text") or s.get("text")
-        src = s.get("url") or s.get("scheme_id") or "unknown"
-        snippet_texts.append(f"- \"{t}\" (source: {src})")
-    prompt = (
-        "You are an assistant that helps match citizens to government schemes.\n"
-        "Do not provide legal advice — only advisory guidance.\n\n"
-        f"User profile:\n{user_profile_text}\n\n"
-        "Retrieved relevant clauses/snippets:\n"
-        f"{chr(10).join(snippet_texts)}\n\n"
-        "Task:\n1) Return up to 5 recommended schemes with: scheme id/title (if available), "
-        "eligibility label (Eligible / Not eligible / Possibly eligible), "
-        "a short reason (one sentence), required documents (bullet list if available), "
-        "apply link (if present), and supporting snippet references (cite the snippet index).\n"
-        "2) Provide a confidence score (0-100) for each recommendation.\n\n"
-        "Return JSON only in the following format:\n"
-        "{\"recommendations\": [{\"scheme_id\":\"\",\"title\":\"\",\"eligibility_label\":\"\",\"confidence\":0.0,"
-        "\"required_documents\":[],\"apply_link\":\"\",\"supporting_snippets\":[{\"text\":\"\",\"url\":\"\",\"score\":0.0}]}]}"
-    )
+    for scheme in SCHEMES:
+        score = 0.0
+        is_eligible = False
 
-    # Call selected LLM provider
-    if LLM_PROVIDER == "openai" and OPENAI_API_KEY:
-        try:
-            # OpenAI completions (chat) example using Chat Completions API (replace with your library)
-            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-            body = {
-                "model": "gpt-4o-mini",  # adjust as available
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 800,
-                "temperature": 0.0,
+        # State filter: if scheme is state-specific and not 'Central' it must match
+        scheme_state = scheme.get("state")
+        if scheme_state and scheme_state != "Central":
+            if profile.state is None or scheme_state != profile.state:
+                continue
+            else:
+                score = 0.5
+
+        sid = scheme.get("id")
+
+        # PM Kisan -> farmer
+        if sid == "pm-kisan":
+            if "farmer" in occupation:
+                score = 0.9
+                is_eligible = True
+
+        # PM SVANidhi -> vendor
+        if sid == "pm-svanidhi":
+            if "vendor" in occupation or "street" in occupation:
+                score = 0.9
+                is_eligible = True
+
+        # Ayushman Bharat -> income < 500000 (simulated)
+        if sid == "ayushman-bharat":
+            if income is not None and income < 500000:
+                score = 0.8
+                is_eligible = True
+
+        # Atal Pension -> age 18-40
+        if sid == "atal-pension":
+            if age is not None and 18 <= age <= 40:
+                score = 0.85
+                is_eligible = True
+
+        # Sukanya Samriddhi -> female child < 10 (here we assume profile.age is child's age)
+        if sid == "sukanya-samriddhi":
+            if (profile.gender and profile.gender.lower().startswith("f")) and (age is not None and age <= 10):
+                score = 0.95
+                is_eligible = True
+
+        # Ladli Behna (MP)
+        if sid == "ladli-behna":
+            if (profile.gender and profile.gender.lower().startswith("f")) and (age is not None and 21 <= age <= 60) and (income is not None and income < 250000):
+                score = 0.95
+                is_eligible = True
+            else:
+                is_eligible = False
+
+        # Rythu Bandhu (Telangana)
+        if sid == "rythu-bandhu":
+            if "farmer" in occupation:
+                score = 0.95
+                is_eligible = True
+            else:
+                is_eligible = False
+
+        # Kanyashree (WB)
+        if sid == "kanyashree":
+            if (profile.gender and profile.gender.lower().startswith("f")) and (profile.occupation and profile.occupation.lower() == "student") and (age is not None and 13 <= age <= 18):
+                score = 0.95
+                is_eligible = True
+            else:
+                is_eligible = False
+
+        # Delhi electricity (assume all Delhi residents)
+        if sid == "delhi-electricity":
+            if scheme_state == "Delhi":
+                is_eligible = True
+                score = 0.9
+
+        if is_eligible and score > 0:
+            entry = scheme.copy()
+            entry["matchScore"] = score
+            results.append(entry)
+
+    # sort by score desc
+    results_sorted = sorted(results, key=lambda x: x.get("matchScore", 0), reverse=True)
+    return results_sorted
+
+# --------- Gemini call helpers ---------
+def build_gemini_payload(prompt_text: str) -> Dict[str, Any]:
+    return {
+        "model": GEMINI_MODEL,
+        "temperature": 0.0,
+        "max_output_tokens": 512,
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt_text}
+                ]
             }
-            resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=30)
+        ]
+    }
+
+def call_gemini(prompt: str) -> Optional[str]:
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set")
+        return None
+
+    # Use v1beta or v1 endpoint; attempt common patterns
+    endpoints = [
+        f"{GEMINI_BASE_URL}/v1beta/models/{GEMINI_MODEL}:generateContent",
+        f"{GEMINI_BASE_URL}/v1/models/{GEMINI_MODEL}:generateContent",
+        f"{GEMINI_BASE_URL}/v1beta/models/{GEMINI_MODEL}:generateText",
+        f"{GEMINI_BASE_URL}/v1/models/{GEMINI_MODEL}:generateText"
+    ]
+
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    body = build_gemini_payload(prompt)
+
+    for ep in endpoints:
+        try:
+            url_with_key = ep + ("?key=" + GEMINI_API_KEY if "?" not in ep else "&key=" + GEMINI_API_KEY)
+            logger.debug("Calling Gemini endpoint: %s", url_with_key)
+            resp = requests.post(url_with_key, headers=headers, json=body, timeout=25)
             resp.raise_for_status()
             data = resp.json()
-            text = data["choices"][0]["message"]["content"]
+            # robust extraction
+            # try candidates -> content -> text parts
+            if isinstance(data, dict):
+                if "candidates" in data and isinstance(data["candidates"], list) and len(data["candidates"]) > 0:
+                    cand = data["candidates"][0]
+                    if isinstance(cand, dict):
+                        # candidate may have 'content' which is list of parts
+                        if "content" in cand and isinstance(cand["content"], list):
+                            texts = []
+                            for part in cand["content"]:
+                                if isinstance(part, dict) and "text" in part:
+                                    texts.append(part["text"])
+                            if texts:
+                                return "\n".join(texts)
+                        if "text" in cand and isinstance(cand["text"], str):
+                            return cand["text"]
+                # alternate shapes
+                if "output" in data:
+                    out = data["output"]
+                    if isinstance(out, dict) and "text" in out:
+                        return out["text"]
+            # fallback: try top-level text
+            if isinstance(data, dict) and "text" in data and isinstance(data["text"], str):
+                return data["text"]
+            # else stringify some portion
+            logger.debug("Gemini response unparsed: %s", json.dumps(data)[:800])
+            return json.dumps(data)
         except Exception as e:
-            logger.exception("OpenAI request failed: %s", e)
-            text = None
-    elif LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
-        try:
-            # Example: Google Gemini HTTP call — user must adapt to exact endpoint used in project
-            headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
-            body = {"prompt": prompt, "max_output_tokens": 800}
-            # NOTE: update URL for your Gemini endpoint / AI Studio endpoint
-            gemini_url = os.environ.get("GEMINI_URL", "https://api.generativeai.google/v1/models/gemini:generate")
-            resp = requests.post(gemini_url, headers=headers, json=body, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            # Extract text depending on response format
-            text = data.get("candidates", [{}])[0].get("content") or data.get("output", {}).get("text")
-        except Exception as e:
-            logger.exception("Gemini request failed: %s", e)
-            text = None
-    else:
-        # Local fallback: craft a simple JSON from the top snippets (safe for demos)
-        logger.info("LLM not configured or provider not available; using local fallback synthesizer.")
-        recommendations = []
-        # group snippets by scheme_id if present
-        by_scheme = {}
-        for idx, s in enumerate(snippets):
-            sid = s.get("scheme_id") or f"unknown_{idx}"
-            by_scheme.setdefault(sid, []).append((idx, s))
-        for sid, items in list(by_scheme.items())[:5]:
-            title = items[0][1].get("title") or f"Scheme {sid}"
-            supporting = []
-            for idx, s in items:
-                supporting.append({
-                    "text": s.get("text")[:MAX_SNIPPET_CHARS],
-                    "url": s.get("url"),
-                    "score": s.get("score")
-                })
-            recommendations.append({
-                "scheme_id": sid,
-                "title": title,
-                "eligibility_label": "Possibly eligible",
-                "confidence": 60.0,
-                "required_documents": [],
-                "apply_link": None,
-                "supporting_snippets": supporting
-            })
-        return {"recommendations": recommendations}
+            logger.warning("Gemini endpoint %s failed: %s", ep, str(e))
+            continue
 
-    # If the LLM returned text attempt to parse the JSON block they were asked to return
-    if text:
-        # attempt to find JSON object inside the returned text
-        try:
-            # find first '{' to start JSON (simple heuristic)
-            first_brace = text.find("{")
-            json_text = text[first_brace:] if first_brace != -1 else text
-            parsed = json.loads(json_text)
-            # Expect parsed["recommendations"]
-            if isinstance(parsed, dict) and "recommendations" in parsed:
-                return parsed
-            # fallback: return simple wrapper with LLM text as explanation
-            return {"recommendations": [], "llm_text": text}
-        except Exception as e:
-            logger.exception("Failed to parse LLM JSON output: %s", e)
-            return {"recommendations": [], "llm_text": text}
-    else:
-        return {"recommendations": []}
+    return None
 
-# Endpoint: health
+# Create a user-friendly prompt for synthesis
+def build_synthesis_prompt(profile: ProfileIn, schemes: List[Dict[str, Any]], language: str) -> str:
+    lang_name = "Hindi" if language and language.lower().startswith("h") else "English"
+    # user context
+    user_ctx = f"Name: {profile.name}\nAge: {profile.age}\nGender: {profile.gender}\nState: {profile.state}\nIncome: INR {profile.income}\nOccupation: {profile.occupation}\n"
+    # schemes context
+    ctx_lines = []
+    for s in schemes:
+        ctx_lines.append(f"Scheme: {s.get('name')}\nBenefits: {s.get('benefits')}\nEligibility: {', '.join(s.get('eligibilityCriteria') or [])}\nSource: {s.get('sourceUrl')}\n---")
+    ctx_text = "\n".join(ctx_lines)[:8000]  # cap length
+
+    prompt = (
+        "You are a helpful government-scheme consultant. Do not provide legal advice. Provide advisory guidance only.\n\n"
+        f"Respond in {lang_name}.\n\n"
+        "User Profile:\n"
+        f"{user_ctx}\n\n"
+        "Retrieved Schemes (context):\n"
+        f"{ctx_text}\n\n"
+        "Instructions:\n"
+        " - For each scheme, write one short bullet explaining why the user might be eligible (point to matching criteria).\n"
+        " - If a scheme does not match, do not include it.\n"
+        " - Provide a final short next-step suggestion (1-2 bullets) for how the user can apply or verify eligibility.\n"
+        " - Keep the response concise (approx. 6-12 short bullets or lines).\n"
+        "Return plain text suitable for display in a UI."
+    )
+    return prompt
+
+# --------- Endpoints ---------
 @app.get("/health")
-async def health():
-    return {"status": "ok", "provider": LLM_PROVIDER, "collection": COLLECTION_NAME}
+def health():
+    return {"status": "ok", "gemini_configured": bool(GEMINI_API_KEY)}
 
-# Endpoint: recommend
-@app.post("/recommend", response_model=RecommendResponse)
-async def recommend(profile: Profile):
-    # Build a canonical query string from profile: prefer free-form text if provided
-    if profile.text and profile.text.strip():
-        query = profile.text.strip()
+@app.post("/retrieve")
+def retrieve(body: RetrieveIn):
+    profile = body.profile
+    try:
+        matched = strict_retrieve(profile)
+        # cast to SchemeOut array
+        return {"schemes": matched}
+    except Exception as e:
+        logger.exception("Retrieve error: %s", e)
+        raise HTTPException(status_code=500, detail="Retrieve failed")
+
+@app.post("/synthesize")
+def synthesize(body: SynthesizeIn):
+    profile = body.profile
+    schemes = body.schemes or []
+    language = body.language or "en"
+
+    # If there are no schemes provided, return an immediate message
+    if not schemes:
+        msg = "No schemes provided for synthesis." if not language.startswith("h") else "सिंथेसिस के लिए कोई योजना प्रदान नहीं की गई।"
+        return {"text": msg}
+
+    prompt = build_synthesis_prompt(profile, schemes, language)
+
+    logger.info("Synthesizing with Gemini (configured=%s) ...", bool(GEMINI_API_KEY))
+    if GEMINI_API_KEY:
+        try:
+            out = call_gemini(prompt)
+            if out:
+                return {"text": out}
+            else:
+                # fallback text if Gemini returned nothing
+                fallback = "Could not generate analysis from Gemini. Please try again later." if not language.startswith("h") else "Gemini से विश्लेषण प्राप्त नहीं कर सके। कृपया बाद में पुनः प्रयास करें।"
+                return {"text": fallback}
+        except Exception as e:
+            logger.exception("Gemini call failed: %s", e)
+            fallback = "Error while generating analysis." if not language.startswith("h") else "विश्लेषण उत्पन्न करते समय त्रुटि हुई।"
+            return {"text": fallback}
     else:
-        # simple canonicalization
-        parts = []
-        if profile.age: parts.append(f"age:{profile.age}")
-        if profile.gender: parts.append(f"gender:{profile.gender}")
-        if profile.state: parts.append(f"state:{profile.state}")
-        if profile.occupation: parts.append(f"occupation:{profile.occupation}")
-        if profile.annual_income is not None: parts.append(f"income:{profile.annual_income}")
-        query = " | ".join(parts) if parts else "general welfare schemes"
+        # Local deterministic fallback (construct simple bullets)
+        lines = []
+        for s in schemes:
+            reason = None
+            sid = s.get("id")
+            # simple heuristic mapping to reasons (mimic frontend logic)
+            if sid == "pm-kisan":
+                reason = "You are a farmer, and PM-Kisan supports landholding farmers."
+            elif sid == "pm-svanidhi":
+                reason = "You are a street vendor; PM SVANidhi offers micro-credit to vendors."
+            elif sid == "ayushman-bharat":
+                reason = "Your income is below the simulated threshold for Ayushman Bharat."
+            elif sid == "atal-pension":
+                reason = "Your age falls in the Atal Pension eligible range."
+            elif sid == "sukanya-samriddhi":
+                reason = "Your profile matches the Sukanya Samriddhi criteria for a girl child."
+            elif sid == "ladli-behna":
+                reason = "You are a woman resident of MP within the eligible age and income range."
+            elif sid == "rythu-bandhu":
+                reason = "You are a farmer in Telangana, matching Rythu Bandhu."
+            elif sid == "kanyashree":
+                reason = "You are a girl student in the eligible age range for Kanyashree."
+            elif sid == "delhi-electricity":
+                reason = "You are a Delhi resident eligible for basic electricity subsidy."
+            else:
+                reason = f"Matches some published eligibility criteria: {', '.join(s.get('eligibilityCriteria') or [])}"
 
-    # Optionally apply metadata filter (e.g., jurisdiction)
-    metadata_filter = {}
-    if profile.state:
-        # the ingestion should store jurisdiction/state in metadata
-        metadata_filter = {"jurisdiction": profile.state}
+            lines.append(f"- {s.get('name')}: {reason}")
 
-    # Retrieve candidate chunks
-    snippets = retrieve_chunks(query, k=TOP_K, metadata_filter=metadata_filter)
-    if not snippets:
-        # try without filter
-        snippets = retrieve_chunks(query, k=TOP_K, metadata_filter=None)
+        next_steps = "- Verify documents (Aadhaar, Income certificate, Residence proof)\n- Visit the official scheme page or your local helpdesk to apply."
+        if language.lower().startswith("h"):
+            # Hindi fallback phrases
+            lines_hi = []
+            for l in lines:
+                # simple translation for common phrases (not exhaustive)
+                lines_hi.append(l.replace("You are", "आप").replace("Your", "आपकी").replace("Verify documents", "प्रमाणपत्र सत्यापित करें"))
+            next_steps_hi = "- दस्तावेज़ सत्यापित करें (आधार, आय प्रमाण, निवास प्रमाण)\n- आवेदन हेतु आधिकारिक पोर्टल या नजदीकी सहायता केंद्र पर जाएँ।"
+            payload_text = "\n".join(lines_hi) + "\n\n" + next_steps_hi
+            return {"text": payload_text}
+        payload_text = "\n".join(lines) + "\n\n" + next_steps
+        return {"text": payload_text}
 
-    # Synthesize answer with LLM (or fallback)
-    synth = synthesize_answer(profile, snippets)
-
-    # Normalize output into Recommendation model
-    recs = []
-    recommendations_json = synth.get("recommendations") if isinstance(synth, dict) else None
-    if recommendations_json:
-        # shape to our Pydantic model
-        for r in recommendations_json:
-            supporting = []
-            for s in r.get("supporting_snippets", []):
-                supporting.append(RecommendationSnippet(
-                    text=s.get("text", "")[:MAX_SNIPPET_CHARS],
-                    scheme_id=s.get("scheme_id"),
-                    url=s.get("url"),
-                    page_no=s.get("page_no"),
-                    score=s.get("score")
-                ))
-            rec = Recommendation(
-                scheme_id=r.get("scheme_id", "") or "",
-                title=r.get("title", "") or "",
-                eligibility_label=r.get("eligibility_label", "Possibly eligible"),
-                confidence=float(r.get("confidence", 0.0)),
-                required_documents=r.get("required_documents", []),
-                apply_link=r.get("apply_link"),
-                supporting_snippets=supporting
-            )
-            recs.append(rec)
-    else:
-        # fallback: transform snippets into simple recommendations (grouped)
-        by_sid = {}
-        for s in snippets:
-            sid = s.get("scheme_id") or s.get("id") or "unknown"
-            by_sid.setdefault(sid, []).append(s)
-        for sid, items in list(by_sid.items())[:5]:
-            supporting = []
-            for s in items:
-                supporting.append(RecommendationSnippet(
-                    text=s.get("text")[:MAX_SNIPPET_CHARS],
-                    scheme_id=s.get("scheme_id"),
-                    url=s.get("url"),
-                    page_no=s.get("page_no"),
-                    score=s.get("score")
-                ))
-            recs.append(Recommendation(
-                scheme_id=sid,
-                title=items[0].get("title") or sid,
-                eligibility_label="Possibly eligible",
-                confidence=60.0,
-                required_documents=[],
-                apply_link=items[0].get("url"),
-                supporting_snippets=supporting
-            ))
-
-    resp = RecommendResponse(profile=profile, recommendations=recs)
-    return JSONResponse(status_code=200, content=json.loads(resp.json()))
-
-# Run with: uvicorn app:app --host 0.0.0.0 --port 8000
+# --------- Run server ---------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=True)
